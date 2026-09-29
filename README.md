@@ -1,6 +1,8 @@
 # AGBref visualization
 https://rnvllflores.github.io/agbref-webmap/
 
+data source: "./data": https://drive.google.com/drive/folders/1NucQVWV67M1uXxrLpv-6VUUJ022844oP?usp=sharing
+
 # AGBref data processing workflow
 
 This repository documents the processing workflow used to generate **AGBref**, a multi-epoch and multi-resolution global reference dataset of above-ground forest biomass (AGB). The workflow extends the logic of **Plot2Map**, an R-based workflow for comparing forest plot data with biomass maps, including plot preprocessing, temporal adjustment, uncertainty estimation, map validation, forest-mask handling, and aggregation across spatial supports. :contentReference[oaicite:0]{index=0}
