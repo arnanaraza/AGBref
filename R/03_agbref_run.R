@@ -1,66 +1,104 @@
 # ================================================================
-# 02_agbref_ready_multiepoch.R
-# Multi-resolution x multi-epoch AGBref-ready aggregation
+# 02_run_AGBref_epoch_window_temporal_adjusted.R
 #
-# Uses old-style exact tile sampling:
-#   - MakeBlockPolygon()
-#   - tile lookup from polygon bbox
-#   - raster::crop(raster(tile), extent(pol))
-#   - raster::extract(..., pol)
-#   - foreach parallel over aggregated cells
-#
-# No temporal biomass adjustment here.
-# Epoch is used only for GFC lossyear correction.
+# AGBref multiresolution / multiepoch run aligned to the Sept-2026 workflow:
+#   1. AVG_YEAR epoch-window selection
+#   2. Target epochs 2005-2025
+#   3. Temporal adjustment using BiomePair(), TempApply(), TempVar()
+#   4. 500m / 1km / 10km / 25km only (no 100m)
 # ================================================================
 
-suppressPackageStartupMessages({
-  library(sp)
-  library(raster)
-  library(dplyr)
-  library(plyr)
-  library(foreach)
-  library(doParallel)
-  library(parallel)
-})
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+
+pacman::p_load(
+  sp,
+  raster,
+  plyr,
+  dplyr,
+  foreach,
+  doParallel,
+  parallel
+)
 
 # ----------------------------
-# 0. Paths and settings
+# 0. Settings
 # ----------------------------
 
-projectDir <- getwd()
+projectDir <- "C:/PVIR_Reproducible"
+
+input_csv <- "C:/PVIR_Reproducible/outputs/agbref_ready_demo/agbref_addv7_2015_with_tc.csv"
+
+scriptsDir <- file.path(projectDir, "R")
 dataDir    <- file.path(projectDir, "data")
-readyDir   <- file.path(projectDir, "outputs", "pvir_ready_demo")
-outDir     <- file.path(projectDir, "outputs", "agbref_ready_multiepoch")
 gfcDir     <- file.path(projectDir, "data", "GFC")
+outDir     <- file.path(projectDir, "outputs", "agbref_epoch_window_temporal_adjusted")
 
 dir.create(outDir, recursive = TRUE, showWarnings = FALSE)
 
-treeCoverFolder <- gfcDir
-lossYearFolder  <- gfcDir
+# Multi-epoch run used by the latest combined AGBref
+target_epochs <- c(2005, 2010, 2015, 2020, 2025)
 
-forestTHs <- c(10)
+# With strict > and <, epoch_window = 11 means integer years ±10.
+epoch_window <- 10
 
-target_epochs <- c(2005, 2010, 2015, 2020)
+# Early-epoch exception:
+# these codes are included for 1995 and 2000 even if AVG_YEAR window excludes them.
+early_epoch_exception_codes <- c(
+  "AUS1", "NAM2", "AFR3", "AFR11",
+  "ASI_PHL", "ASI_PH",
+  "CAM1", "AFR_LW"
+)
 
+# Not used in the current 2005-2025 production run.
+early_exception_epochs <- integer(0)
+
+# Production resolutions. These labels match the current combined AGBref.
+# Current QC rule: n > 4 for 500m/1km/10km, n > 5 for 25km.
 scales <- data.frame(
-  label = c("100m", "500m", "1km", "10km", "25km"),
-  aggr  = c(0.001, 0.005, 0.01, 0.1, 0.25),
-  minPlots = c(1, 1, 1, 1, 1),
+  label = c("500m", "1km", "10km", "25km"),
+  aggr  = c(0.005, 0.01, 0.1, 0.25),
+  minPlots = c(5, 5, 5, 6),
   stringsAsFactors = FALSE
 )
 
-# Use controlled parallelism; too many workers can duplicate raster reads.
+forestTH <- 10
+
+# IMPORTANT:
+# The latest working AGBref validation uses the temporally harmonized,
+# grid-aggregated AGB as the primary reference. Keep GFC FF as a diagnostic.
+# Set TRUE only when intentionally validating wall-to-wall cell means.
+apply_grid_forest_fraction <- FALSE
+
+# If FF scaling is enabled and GFC is missing, keep the unscaled value.
+fallback_to_unscaled_when_gfc_missing <- TRUE
+
+# Latest targeted QC correction:
+# AUS1, only 10km/25km, only AGB > 400 Mg/ha; use 80% of TC_GRID_MEAN as
+# the extra scaling factor, without altering the stored TC_GRID_MEAN.
+apply_aus1_high_agb_fix <- TRUE
+aus1_tc_discount <- 0.80
+
+# Set TRUE ONLY if input_csv is raw and these legacy unit conversions have
+# not already been applied. Leave FALSE to avoid double conversion.
+apply_legacy_unit_conversions <- FALSE
+
+# Use neighboring Hansen tiles but extract only from overlapping raster extents.
+use_3x3_gfc_tile_window <- TRUE
+
 ncores <- max(1, min(4, parallel::detectCores() - 1))
 
 SRS <- sp::CRS("+proj=longlat +datum=WGS84 +no_defs")
 
-message("Project root:     ", projectDir)
-message("Output dir:       ", outDir)
-message("GFC dir:          ", gfcDir)
-message("Parallel workers: ", ncores)
+# ----------------------------
+# 1. Source temporal adjustment scripts
+# ----------------------------
+
+source(file.path(scriptsDir, "BiomePair.R"))
+source(file.path(scriptsDir, "TempFix.R"))
+source(file.path(scriptsDir, "TempVis.R"))
 
 # ----------------------------
-# 1. Utility functions
+# 2. Utilities
 # ----------------------------
 
 num_clean <- function(x) {
@@ -78,11 +116,16 @@ modalClass <- function(x) {
   names(sort(table(x), decreasing = TRUE))[1]
 }
 
-safe_inv_var <- function(x) {
+safe_mean <- function(x) {
   x <- num_clean(x)
-  x <- x[is.finite(x) & x > 0]
-  if (length(x) == 0) return(NA_real_)
-  1 / sum(1 / x)
+  if (all(!is.finite(x))) return(NA_real_)
+  mean(x, na.rm = TRUE)
+}
+
+safe_sd <- function(x) {
+  x <- num_clean(x)
+  if (sum(is.finite(x)) <= 1) return(NA_real_)
+  sd(x, na.rm = TRUE)
 }
 
 safe_wmean <- function(x, w) {
@@ -95,20 +138,82 @@ safe_wmean <- function(x, w) {
   weighted.mean(x[ok], w[ok], na.rm = TRUE)
 }
 
-safe_sd <- function(x) {
+safe_inv_var <- function(x) {
   x <- num_clean(x)
-  if (sum(is.finite(x)) <= 1) return(NA_real_)
-  sd(x, na.rm = TRUE)
-}
-
-safe_mean <- function(x) {
-  x <- num_clean(x)
-  if (all(!is.finite(x))) return(NA_real_)
-  mean(x, na.rm = TRUE)
+  x <- x[is.finite(x) & x > 0]
+  if (length(x) == 0) return(NA_real_)
+  1 / sum(1 / x)
 }
 
 # ----------------------------
-# 2. Old-style polygon and tile lookup
+# 3. Load input
+# ----------------------------
+
+if (exists("val.rm", envir = .GlobalEnv)) {
+  rm(val.rm, envir = .GlobalEnv)
+}
+
+if (!file.exists(input_csv)) {
+  stop("Input CSV does not exist: ", input_csv, call. = FALSE)
+}
+
+val.rm <- read.csv(input_csv, stringsAsFactors = FALSE)
+
+message("Loaded input: ", input_csv)
+message("Rows loaded: ", nrow(val.rm))
+
+# Required/fallback columns
+if (!"ZONE" %in% names(val.rm)) val.rm$ZONE <- "All"
+if (!"BIO" %in% names(val.rm)) val.rm$BIO <- NA
+if (!"GEZ" %in% names(val.rm)) val.rm$GEZ <- NA
+if (!"AGB_T_HA_ORIG" %in% names(val.rm)) val.rm$AGB_T_HA_ORIG <- NA_real_
+if (!"SIZE_HA" %in% names(val.rm)) val.rm$SIZE_HA <- NA_real_
+if (!"varTot" %in% names(val.rm)) val.rm$varTot <- 1
+if (!"varPlot" %in% names(val.rm)) val.rm$varPlot <- val.rm$varTot
+if (!"OPEN" %in% names(val.rm)) val.rm$OPEN <- NA
+if (!"VER" %in% names(val.rm)) val.rm$VER <- NA
+if (!"INVENTORY" %in% names(val.rm)) val.rm$INVENTORY <- NA
+if (!"TIER" %in% names(val.rm)) val.rm$TIER <- NA
+if (!"CODE" %in% names(val.rm)) val.rm$CODE <- NA
+if (!"AVG_YEAR" %in% names(val.rm)) stop("AVG_YEAR is missing.", call. = FALSE)
+if (!"AGB_T_HA" %in% names(val.rm)) stop("AGB_T_HA is missing.", call. = FALSE)
+
+val.rm$POINT_X <- num_clean(val.rm$POINT_X)
+val.rm$POINT_Y <- num_clean(val.rm$POINT_Y)
+val.rm$AGB_T_HA <- num_clean(val.rm$AGB_T_HA)
+val.rm$AGB_T_HA_ORIG <- num_clean(val.rm$AGB_T_HA_ORIG)
+val.rm$AVG_YEAR <- num_clean(val.rm$AVG_YEAR)
+val.rm$SIZE_HA <- num_clean(val.rm$SIZE_HA)
+val.rm$varTot <- num_clean(val.rm$varTot)
+val.rm$varPlot <- num_clean(val.rm$varPlot)
+
+# Row-wise fallback
+bad_orig <- !is.finite(val.rm$AGB_T_HA_ORIG) & is.finite(val.rm$AGB_T_HA)
+val.rm$AGB_T_HA_ORIG[bad_orig] <- val.rm$AGB_T_HA[bad_orig]
+
+# If varPlot missing, use varTot
+bad_varplot <- !is.finite(val.rm$varPlot) & is.finite(val.rm$varTot)
+val.rm$varPlot[bad_varplot] <- val.rm$varTot[bad_varplot]
+
+val.rm$BIO <- ifelse(is.na(val.rm$BIO), "NA", val.rm$BIO)
+
+# Optional legacy unit conversions. Run exactly once on raw inputs.
+if (isTRUE(apply_legacy_unit_conversions)) {
+  idx049 <- val.rm$CODE %in% c("ASI_PH", "SAM_guy", "SAM_ECU")
+  val.rm$AGB_T_HA[idx049] <- val.rm$AGB_T_HA[idx049] / 0.49
+  val.rm$AGB_T_HA_ORIG[idx049] <- val.rm$AGB_T_HA_ORIG[idx049] / 0.49
+
+  idxjap <- val.rm$CODE == "ASI_JAP"
+  val.rm$AGB_T_HA[idxjap] <- val.rm$AGB_T_HA[idxjap] / 0.2
+  val.rm$AGB_T_HA_ORIG[idxjap] <- val.rm$AGB_T_HA_ORIG[idxjap] / 0.2
+}
+
+# No legacy filtering here.
+# No ASI_JAP removal.
+# No PH/Guyana/Ecuador correction here unless you intentionally add it.
+
+# ----------------------------
+# 4. GFC tile helpers
 # ----------------------------
 
 MakeBlockPolygon <- function(x, y, size) {
@@ -122,124 +227,195 @@ MakeBlockPolygon <- function(x, y, size) {
     )
   )
   
-  pol1 <- sp::Polygons(list(pol0), "pol")
-  sp::SpatialPolygons(list(pol1), proj4string = SRS)
+  sp::SpatialPolygons(
+    list(sp::Polygons(list(pol0), "pol")),
+    proj4string = SRS
+  )
 }
-
-gfc_tile_codes_from_pol <- function(pol) {
+gfc_code_from_xy <- function(x, y) {
+  lon <- 10 * (x %/% 10)
+  lat <- 10 * (y %/% 10) + 10
   
+  LtX <- ifelse(lon < 0, "W", "E")
+  LtY <- ifelse(lat < 0, "S", "N")
+  
+  paste0(
+    sprintf("%02d", abs(lat)), LtY,
+    "_",
+    sprintf("%03d", abs(lon)), LtX
+  )
+}
+parse_gfc_code <- function(code) {
+  lat_part <- sub("_.*$", "", code)
+  lon_part <- sub("^.*_", "", code)
+  
+  lat_val <- as.numeric(substr(lat_part, 1, nchar(lat_part) - 1))
+  lat_hemi <- substr(lat_part, nchar(lat_part), nchar(lat_part))
+  
+  lon_val <- as.numeric(substr(lon_part, 1, nchar(lon_part) - 1))
+  lon_hemi <- substr(lon_part, nchar(lon_part), nchar(lon_part))
+  
+  data.frame(
+    lat_edge = ifelse(lat_hemi == "S", -lat_val, lat_val),
+    lon_base = ifelse(lon_hemi == "W", -lon_val, lon_val)
+  )
+}
+format_gfc_code <- function(lat_edge, lon_base) {
+  LtX <- ifelse(lon_base < 0, "W", "E")
+  LtY <- ifelse(lat_edge < 0, "S", "N")
+  
+  paste0(
+    sprintf("%02d", abs(lat_edge)), LtY,
+    "_",
+    sprintf("%03d", abs(lon_base)), LtX
+  )
+}
+expand_gfc_codes_3x3 <- function(codes) {
+  out <- character(0)
+  
+  for (cd in unique(codes)) {
+    p <- parse_gfc_code(cd)
+    
+    grid <- expand.grid(
+      lat_edge = p$lat_edge + c(-10, 0, 10),
+      lon_base = p$lon_base + c(-10, 0, 10)
+    )
+    
+    out <- c(out, mapply(format_gfc_code, grid$lat_edge, grid$lon_base))
+  }
+  
+  unique(out)
+}
+GFCtileCodes_core <- function(pol) {
   bb <- unname(sp::bbox(pol))
-  crds <- expand.grid(x = bb[1, ], y = bb[2, ])
   
-  codes <- character(nrow(crds))
+  xs <- unique(c(bb[1, 1], bb[1, 2], mean(bb[1, ])))
+  ys <- unique(c(bb[2, 1], bb[2, 2], mean(bb[2, ])))
   
-  for (i in seq_len(nrow(crds))) {
-    
-    lon <- 10 * (crds[i, 1] %/% 10)
-    lat <- 10 * (crds[i, 2] %/% 10) + 10
-    
-    LtX <- ifelse(lon < 0, "W", "E")
-    LtY <- ifelse(lat < 0, "S", "N")
-    
-    WE <- paste0(sprintf("%03d", abs(lon)), LtX)
-    NS <- paste0(sprintf("%02d", abs(lat)), LtY)
-    
-    # Hansen/gfcanalysis format: 50N_110E
-    codes[i] <- paste0(NS, "_", WE)
+  xy <- expand.grid(x = xs, y = ys)
+  
+  unique(mapply(gfc_code_from_xy, xy$x, xy$y))
+}
+GFCtileCodes <- function(pol) {
+  codes <- GFCtileCodes_core(pol)
+  
+  if (isTRUE(use_3x3_gfc_tile_window)) {
+    codes <- expand_gfc_codes_3x3(codes)
   }
   
   unique(codes)
 }
-
 find_gfc_tile <- function(tile_code, layer = c("treecover2000", "lossyear")) {
-  
   layer <- match.arg(layer)
-  
-  pat <- paste0(layer, "_", tile_code, "\\.tif$")
   
   f <- list.files(
     gfcDir,
-    pattern = pat,
+    pattern = paste0(layer, "_", tile_code, "\\.tif$"),
     full.names = TRUE,
     recursive = TRUE,
     ignore.case = TRUE
   )
   
   if (length(f) == 0) return(NA_character_)
-  
   f[1]
 }
-
-TCtileNames_gfc <- function(pol) {
-  codes <- gfc_tile_codes_from_pol(pol)
-  f <- vapply(codes, find_gfc_tile, character(1), layer = "treecover2000")
-  unique(f[!is.na(f) & file.exists(f)])
+extent_overlaps <- function(r_ext, p_ext) {
+  !(r_ext@xmax <= p_ext@xmin ||
+      r_ext@xmin >= p_ext@xmax ||
+      r_ext@ymax <= p_ext@ymin ||
+      r_ext@ymin >= p_ext@ymax)
 }
-
-LYtileNames_gfc <- function(pol) {
-  codes <- gfc_tile_codes_from_pol(pol)
-  f <- vapply(codes, find_gfc_tile, character(1), layer = "lossyear")
-  unique(f[!is.na(f) & file.exists(f)])
-}
-
-# ----------------------------
-# 3. GFC sampling old-style, per exact tile
-# ----------------------------
-
-sampleTreeCover_gfc <- function(pol,
-                                thresholds,
-                                target_year = 2010,
-                                wghts = FALSE) {
+get_tc_tiles <- function(pol) {
+  codes <- GFCtileCodes(pol)
   
-  tc_tiles <- TCtileNames_gfc(pol)
+  f <- vapply(codes, function(z) find_gfc_tile(z, "treecover2000"), character(1))
+  f <- unique(f[!is.na(f) & file.exists(f)])
+  
+  if (length(f) == 0) return(character(0))
+  
+  p_ext <- raster::extent(pol)
+  
+  keep <- vapply(
+    f,
+    function(ff) {
+      tryCatch({
+        extent_overlaps(raster::extent(raster::raster(ff)), p_ext)
+      }, error = function(e) FALSE)
+    },
+    logical(1)
+  )
+  
+  f[keep]
+}
+# ----------------------------
+# 5. GFC extraction
+# ----------------------------
+
+apply_epoch_loss_to_tc <- function(tc, ly, target_year) {
+  target_year <- as.integer(target_year)
+  
+  if (target_year > 2000 && length(tc) == length(ly)) {
+    loss_cutoff <- target_year - 2000
+    
+    tc <- ifelse(
+      !is.na(ly) & ly >= 1 & ly <= loss_cutoff,
+      0,
+      tc
+    )
+  }
+  
+  tc
+}
+
+extract_gfc_polygon <- function(pol, target_year) {
+  tc_tiles <- get_tc_tiles(pol)
   
   if (length(tc_tiles) == 0) {
-    return(rep(0, length(thresholds)))
+    return(list(
+      ff = NA_real_,
+      tc_mean = NA_real_,
+      tc_sd = NA_real_,
+      pixel_n = 0,
+      status = "NO_TC_TILE"
+    ))
   }
   
   all_tc <- numeric(0)
   all_ly <- numeric(0)
+  status <- "OK"
+  p_ext <- raster::extent(pol)
   
   for (tc_file in tc_tiles) {
-    
-    tile_code <- sub("^.*treecover2000_", "", basename(tc_file))
+    tile_code <- sub("^.*treecover2000_", "", basename(tc_file), ignore.case = TRUE)
     tile_code <- sub("\\.tif$", "", tile_code, ignore.case = TRUE)
     
-    ly_file <- find_gfc_tile(tile_code, layer = "lossyear")
+    ly_file <- find_gfc_tile(tile_code, "lossyear")
     
-    tc_vals <- NULL
-    ly_vals <- NULL
-    
-    # Extract treecover
     tc_vals <- tryCatch({
       r_tc <- raster::raster(tc_file)
-      r_tc_crop <- raster::crop(r_tc, raster::extent(pol))
-      v <- raster::extract(r_tc_crop, pol)[[1]]
-      as.numeric(v)
+      if (!extent_overlaps(raster::extent(r_tc), p_ext)) return(numeric(0))
+      r_tc_crop <- raster::crop(r_tc, p_ext)
+      as.numeric(raster::extract(r_tc_crop, pol)[[1]])
     }, error = function(e) {
+      status <<- "TC_ERROR"
       numeric(0)
     })
     
     if (length(tc_vals) == 0) next
     
-    # Extract lossyear for same polygon/tile
+    ly_vals <- rep(NA_real_, length(tc_vals))
+    
     if (!is.na(ly_file) && file.exists(ly_file) && target_year > 2000) {
       ly_vals <- tryCatch({
         r_ly <- raster::raster(ly_file)
-        r_ly_crop <- raster::crop(r_ly, raster::extent(pol))
-        v <- raster::extract(r_ly_crop, pol)[[1]]
-        as.numeric(v)
+        if (!extent_overlaps(raster::extent(r_ly), p_ext)) return(rep(NA_real_, length(tc_vals)))
+        r_ly_crop <- raster::crop(r_ly, p_ext)
+        v <- as.numeric(raster::extract(r_ly_crop, pol)[[1]])
+        if (length(v) != length(tc_vals)) rep(NA_real_, length(tc_vals)) else v
       }, error = function(e) {
+        status <<- "LY_ERROR"
         rep(NA_real_, length(tc_vals))
       })
-      
-      # If mismatch happens, ignore loss adjustment for this tile rather than crash.
-      if (length(ly_vals) != length(tc_vals)) {
-        ly_vals <- rep(NA_real_, length(tc_vals))
-      }
-      
-    } else {
-      ly_vals <- rep(NA_real_, length(tc_vals))
     }
     
     all_tc <- c(all_tc, tc_vals)
@@ -251,149 +427,65 @@ sampleTreeCover_gfc <- function(pol,
   all_ly <- all_ly[ok]
   
   if (length(all_tc) == 0) {
-    return(rep(0, length(thresholds)))
+    return(list(
+      ff = NA_real_,
+      tc_mean = NA_real_,
+      tc_sd = NA_real_,
+      pixel_n = 0,
+      status = "NO_TC_PIXELS"
+    ))
   }
   
-  if (target_year > 2000 && length(all_ly) == length(all_tc)) {
-    all_tc <- ifelse(
-      !is.na(all_ly) & all_ly >= 1 & all_ly <= target_year - 2000,
-      0,
-      all_tc
-    )
+  tc_epoch <- apply_epoch_loss_to_tc(all_tc, all_ly, target_year)
+  tc_epoch <- tc_epoch[!is.na(tc_epoch)]
+  
+  if (length(tc_epoch) == 0) {
+    return(list(
+      ff = NA_real_,
+      tc_mean = NA_real_,
+      tc_sd = NA_real_,
+      pixel_n = 0,
+      status = "NO_TC_AFTER_LOSS"
+    ))
   }
   
-  out <- numeric(0)
-  
-  for (threshold in thresholds) {
-    ff <- mean(ifelse(all_tc > threshold, 1.0, 0.0), na.rm = TRUE)
-    if (!is.finite(ff)) ff <- 0
-    out <- c(out, ff)
-  }
-  
-  out
-}
-
-sampleTCStats_gfc <- function(pol,
-                              target_year = 2010) {
-  
-  tc_tiles <- TCtileNames_gfc(pol)
-  
-  if (length(tc_tiles) == 0) {
-    return(list(SD = NA_real_, MEAN = NA_real_))
-  }
-  
-  all_tc <- numeric(0)
-  all_ly <- numeric(0)
-  
-  for (tc_file in tc_tiles) {
-    
-    tile_code <- sub("^.*treecover2000_", "", basename(tc_file))
-    tile_code <- sub("\\.tif$", "", tile_code, ignore.case = TRUE)
-    
-    ly_file <- find_gfc_tile(tile_code, layer = "lossyear")
-    
-    tc_vals <- tryCatch({
-      r_tc <- raster::raster(tc_file)
-      r_tc_crop <- raster::crop(r_tc, raster::extent(pol))
-      v <- raster::extract(r_tc_crop, pol)[[1]]
-      as.numeric(v)
-    }, error = function(e) {
-      numeric(0)
-    })
-    
-    if (length(tc_vals) == 0) next
-    
-    if (!is.na(ly_file) && file.exists(ly_file) && target_year > 2000) {
-      ly_vals <- tryCatch({
-        r_ly <- raster::raster(ly_file)
-        r_ly_crop <- raster::crop(r_ly, raster::extent(pol))
-        v <- raster::extract(r_ly_crop, pol)[[1]]
-        as.numeric(v)
-      }, error = function(e) {
-        rep(NA_real_, length(tc_vals))
-      })
-      
-      if (length(ly_vals) != length(tc_vals)) {
-        ly_vals <- rep(NA_real_, length(tc_vals))
-      }
-      
-    } else {
-      ly_vals <- rep(NA_real_, length(tc_vals))
-    }
-    
-    all_tc <- c(all_tc, tc_vals)
-    all_ly <- c(all_ly, ly_vals)
-  }
-  
-  ok <- !is.na(all_tc)
-  all_tc <- all_tc[ok]
-  all_ly <- all_ly[ok]
-  
-  if (length(all_tc) == 0) {
-    return(list(SD = NA_real_, MEAN = NA_real_))
-  }
-  
-  if (target_year > 2000 && length(all_ly) == length(all_tc)) {
-    all_tc <- ifelse(
-      !is.na(all_ly) & all_ly >= 1 & all_ly <= target_year - 2000,
-      0,
-      all_tc
-    )
-  }
+  ff <- mean(tc_epoch > forestTH, na.rm = TRUE)
+  ff <- pmin(pmax(ff, 0), 1)
   
   list(
-    SD = ifelse(length(all_tc) > 1, sd(all_tc, na.rm = TRUE), NA_real_),
-    MEAN = mean(all_tc, na.rm = TRUE)
+    ff = ff,
+    tc_mean = mean(tc_epoch, na.rm = TRUE),
+    tc_sd = ifelse(length(tc_epoch) > 1, sd(tc_epoch, na.rm = TRUE), NA_real_),
+    pixel_n = length(tc_epoch),
+    status = status
   )
 }
 
-extract_tc_points_gfc <- function(dat,
-                                  target_year = 2010) {
+extract_tc_points_epoch <- function(dat, target_year) {
+  out <- rep(NA_real_, nrow(dat))
+  dat$.row_id <- seq_len(nrow(dat))
+  dat$.tile_code <- gfc_code_from_xy(dat$POINT_X, dat$POINT_Y)
   
-  tc_out <- rep(NA_real_, nrow(dat))
-  
-  # group points by GFC tile code
-  tmp <- dat
-  tmp$.row_id <- seq_len(nrow(tmp))
-  
-  tmp$.tile_lon <- 10 * (tmp$POINT_X %/% 10)
-  tmp$.tile_lat <- 10 * (tmp$POINT_Y %/% 10) + 10
-  
-  tmp$.LtX <- ifelse(tmp$.tile_lon < 0, "W", "E")
-  tmp$.LtY <- ifelse(tmp$.tile_lat < 0, "S", "N")
-  
-  tmp$.tile_code <- paste0(
-    sprintf("%02d", abs(tmp$.tile_lat)), tmp$.LtY,
-    "_",
-    sprintf("%03d", abs(tmp$.tile_lon)), tmp$.LtX
-  )
-  
-  for (tile_code in unique(tmp$.tile_code)) {
+  for (tile_code in unique(dat$.tile_code)) {
+    ids <- which(dat$.tile_code == tile_code)
     
-    ids <- which(tmp$.tile_code == tile_code)
-    
-    tc_file <- find_gfc_tile(tile_code, layer = "treecover2000")
-    ly_file <- find_gfc_tile(tile_code, layer = "lossyear")
+    tc_file <- find_gfc_tile(tile_code, "treecover2000")
+    ly_file <- find_gfc_tile(tile_code, "lossyear")
     
     if (is.na(tc_file) || !file.exists(tc_file)) next
     
-    pts <- sp::SpatialPoints(
-      tmp[ids, c("POINT_X", "POINT_Y")],
-      proj4string = SRS
+    pts <- sp::SpatialPoints(dat[ids, c("POINT_X", "POINT_Y")], proj4string = SRS)
+    
+    tc_vals <- tryCatch(
+      raster::extract(raster::raster(tc_file), pts),
+      error = function(e) rep(NA_real_, length(ids))
     )
     
-    tc_vals <- tryCatch({
-      raster::extract(raster::raster(tc_file), pts)
-    }, error = function(e) {
-      rep(NA_real_, length(ids))
-    })
-    
     if (!is.na(ly_file) && file.exists(ly_file) && target_year > 2000) {
-      ly_vals <- tryCatch({
-        raster::extract(raster::raster(ly_file), pts)
-      }, error = function(e) {
-        rep(NA_real_, length(ids))
-      })
+      ly_vals <- tryCatch(
+        raster::extract(raster::raster(ly_file), pts),
+        error = function(e) rep(NA_real_, length(ids))
+      )
       
       if (length(ly_vals) == length(tc_vals)) {
         tc_vals <- ifelse(
@@ -404,539 +496,353 @@ extract_tc_points_gfc <- function(dat,
       }
     }
     
-    tc_out[tmp$.row_id[ids]] <- tc_vals
+    out[dat$.row_id[ids]] <- tc_vals
   }
   
-  tc_out
+  out
 }
 
 # ----------------------------
-# 4. Load val.rm
+# 6. Temporal adjustment
 # ----------------------------
 
-input_csv <- file.path(readyDir, "agbref_addv7_with_tc.csv")
+apply_temporal_adjustment <- function(dat, epoch) {
 
-if (!exists("val.rm")) {
-  if (!file.exists(input_csv)) {
-    stop(
-      "val.rm not found in memory and input CSV missing:\n",
-      input_csv,
-      call. = FALSE
-    )
+  if (nrow(dat) == 0) return(dat)
+
+  # Stable row key so TempApply/TempVar output can be checked/restored.
+  dat$.ROW_ID <- seq_len(nrow(dat))
+
+  dat <- BiomePair(dat)
+
+  if (!".ROW_ID" %in% names(dat)) {
+    stop("BiomePair() dropped .ROW_ID; temporal adjustment cannot be safely aligned.",
+         call. = FALSE)
   }
-  val.rm <- read.csv(input_csv, stringsAsFactors = FALSE)
+
+  gez <- sort(unique(dat$GEZ))
+  gez <- gez[!is.na(gez)]
+
+  if (length(gez) == 0) {
+    warning("No GEZ found for epoch ", epoch, ". Returning unadjusted filtered data.")
+    dat$MapYear <- epoch
+    return(dat)
+  }
+
+  dat2 <- plyr::ldply(
+    lapply(gez, function(z) TempApply(dat, z, epoch)),
+    data.frame
+  )
+
+  if (is.null(dat2) || nrow(dat2) == 0) {
+    warning("TempApply returned zero rows for epoch ", epoch)
+    return(dat[0, ])
+  }
+
+  if (!".ROW_ID" %in% names(dat2)) {
+    stop("TempApply() dropped .ROW_ID; fix TempFix.R before continuing.",
+         call. = FALSE)
+  }
+
+  # Preserve TempApply-adjusted AGB by row ID before TempVar.
+  agb_after_tempapply <- setNames(
+    num_clean(dat2$AGB_T_HA),
+    as.character(dat2$.ROW_ID)
+  )
+
+  dat3 <- plyr::ldply(
+    lapply(gez, function(z) TempVar(dat2, z, epoch)),
+    data.frame
+  )
+
+  if (is.null(dat3) || nrow(dat3) == 0) {
+    warning("TempVar returned zero rows for epoch ", epoch)
+    dat3 <- dat2
+  }
+
+  if (!".ROW_ID" %in% names(dat3)) {
+    stop("TempVar() dropped .ROW_ID; fix TempFix.R before continuing.",
+         call. = FALSE)
+  }
+
+  # TempVar should alter uncertainty, not the temporally adjusted biomass.
+  # Restore AGB_T_HA explicitly by stable row ID. This avoids the known
+  # row-order reassignment problem in older TempVar implementations.
+  m <- match(as.character(dat3$.ROW_ID), names(agb_after_tempapply))
+  okm <- !is.na(m)
+  dat3$AGB_T_HA[okm] <- unname(agb_after_tempapply[m[okm]])
+
+  if (!"sdGrowth" %in% names(dat3)) dat3$sdGrowth <- NA_real_
+  if (!"varTot" %in% names(dat3)) dat3$varTot <- dat3$varPlot
+  if (!"varPlot" %in% names(dat3)) dat3$varPlot <- dat3$varTot
+
+  dat3$sdGrowth <- num_clean(dat3$sdGrowth)
+  fill_growth <- mean(dat3$sdGrowth[is.finite(dat3$sdGrowth)], na.rm = TRUE)
+  if (!is.finite(fill_growth)) fill_growth <- 0
+  dat3$sdGrowth[!is.finite(dat3$sdGrowth)] <- fill_growth
+
+  dat3$varTot <- num_clean(dat3$varTot)
+  dat3$varPlot <- num_clean(dat3$varPlot)
+  bad_v <- !is.finite(dat3$varTot)
+  dat3$varTot[bad_v] <- dat3$varPlot[bad_v]
+  dat3$varTot[!is.finite(dat3$varTot)] <- 1
+
+  dat3$varTot <- dat3$varTot + dat3$sdGrowth^2
+  dat3$SD <- sqrt(dat3$varTot)
+  dat3$MapYear <- epoch
+
+  dat3
 }
-
-if (!"ZONE" %in% names(val.rm)) val.rm$ZONE <- "All"
-if (!"BIO" %in% names(val.rm)) stop("val.rm must contain BIO.", call. = FALSE)
-
-val.rm$BIO <- ifelse(is.na(val.rm$BIO), "NA", val.rm$BIO)
 
 # ----------------------------
-# 5. Clean required numeric columns
+# 7. Main aggregation
 # ----------------------------
 
-message("\nCleaning numeric columns...")
+make_agbref_epoch_resolution <- function(dat, epoch, res_label, aggr, minPlots = 1) {
 
-val.rm$POINT_X <- num_clean(val.rm$POINT_X)
-val.rm$POINT_Y <- num_clean(val.rm$POINT_Y)
-
-if ("AGB_T_HA" %in% names(val.rm)) {
-  val.rm$AGB_T_HA <- num_clean(val.rm$AGB_T_HA)
-}
-
-if ("AGB_T_HA_ORIG" %in% names(val.rm)) {
-  val.rm$AGB_T_HA_ORIG <- num_clean(val.rm$AGB_T_HA_ORIG)
-}
-
-if (!"AGB_T_HA_ORIG" %in% names(val.rm)) {
-  if (!"AGB_T_HA" %in% names(val.rm)) {
-    stop("Both AGB_T_HA_ORIG and AGB_T_HA are missing.", call. = FALSE)
-  }
-  val.rm$AGB_T_HA_ORIG <- val.rm$AGB_T_HA
-}
-
-if (all(is.na(val.rm$AGB_T_HA_ORIG)) && "AGB_T_HA" %in% names(val.rm)) {
-  val.rm$AGB_T_HA_ORIG <- val.rm$AGB_T_HA
-}
-
-if (!"AGB_T_HA" %in% names(val.rm) || all(is.na(val.rm$AGB_T_HA))) {
-  val.rm$AGB_T_HA <- val.rm$AGB_T_HA_ORIG
-}
-
-if ("SIZE_HA" %in% names(val.rm)) {
-  val.rm$SIZE_HA <- num_clean(val.rm$SIZE_HA)
-} else {
-  val.rm$SIZE_HA <- NA_real_
-}
-
-if ("varTot" %in% names(val.rm)) {
-  val.rm$varTot <- num_clean(val.rm$varTot)
-} else {
-  val.rm$varTot <- NA_real_
-}
-
-if (all(is.na(val.rm$varTot))) {
-  val.rm$varTot <- 1
-}
-
-if ("tc" %in% names(val.rm)) {
-  val.rm$tc <- num_clean(val.rm$tc)
-}
-
-# ----------------------------
-# 6. Check GFC files
-# ----------------------------
-
-tc_files <- list.files(
-  gfcDir,
-  pattern = "treecover2000.*\\.tif$",
-  full.names = TRUE,
-  recursive = TRUE,
-  ignore.case = TRUE
-)
-
-ly_files <- list.files(
-  gfcDir,
-  pattern = "lossyear.*\\.tif$",
-  full.names = TRUE,
-  recursive = TRUE,
-  ignore.case = TRUE
-)
-
-if (length(tc_files) == 0) {
-  stop("No treecover2000 tiles found in: ", gfcDir, call. = FALSE)
-}
-
-message("Treecover tiles found: ", length(tc_files))
-message("Lossyear tiles found:  ", length(ly_files))
-
-# ----------------------------
-# 7. Input diagnostics
-# ----------------------------
-
-message("\n--- Input diagnostics after cleaning ---")
-message("nrow(val.rm): ", nrow(val.rm))
-
-message("POINT_X summary:")
-print(summary(val.rm$POINT_X))
-
-message("POINT_Y summary:")
-print(summary(val.rm$POINT_Y))
-
-message("AGB_T_HA_ORIG summary:")
-print(summary(val.rm$AGB_T_HA_ORIG))
-
-message("AGB_T_HA summary:")
-print(summary(val.rm$AGB_T_HA))
-
-message("Valid coord + AGB_ORIG rows:")
-print(sum(
-  is.finite(val.rm$POINT_X) &
-    is.finite(val.rm$POINT_Y) &
-    is.finite(val.rm$AGB_T_HA_ORIG)
-))
-
-diag_cells <- val.rm %>%
-  mutate(
-    Xnew_100m = 0.001 * (0.5 + POINT_X %/% 0.001),
-    Ynew_100m = 0.001 * (0.5 + POINT_Y %/% 0.001)
-  ) %>%
-  summarise(
-    n_points = n(),
-    n_100m_cells = n_distinct(paste(Xnew_100m, Ynew_100m))
-  )
-
-print(diag_cells)
-
-# ----------------------------
-# 8. Main invDasymetry old-style with exact GFC tiles
-# ----------------------------
-
-invDasymetry_gfc_exact <- function(plots,
-                                   clmn = "ZONE",
-                                   value = "All",
-                                   aggr = 0.001,
-                                   minPlots = 1,
-                                   forestTHs = c(10),
-                                   target_year = 2010,
-                                   ncores = 1) {
-  
-  if (value == "All") plots$ZONE <- "All"
-  
-  if (!clmn %in% names(plots)) {
-    stop("Attribute ", clmn, " not found.", call. = FALSE)
-  }
-  
-  plots <- plots[plots[[clmn]] == value, , drop = FALSE]
-  
-  if (nrow(plots) == 0) {
-    stop("There are no records satisfying the selection criterion.", call. = FALSE)
-  }
-  
-  needed <- c(
-    "POINT_X", "POINT_Y",
-    "AGB_T_HA", "AGB_T_HA_ORIG",
-    "SIZE_HA", "BIO", "CODE", "OPEN", "VER",
-    "INVENTORY", "TIER", "AVG_YEAR",
-    "varTot"
-  )
-  
-  miss <- setdiff(needed, names(plots))
-  if (length(miss) > 0) {
-    stop("Missing columns: ", paste(miss, collapse = ", "), call. = FALSE)
-  }
-  
-  plots$POINT_X <- num_clean(plots$POINT_X)
-  plots$POINT_Y <- num_clean(plots$POINT_Y)
-  plots$AGB_T_HA <- num_clean(plots$AGB_T_HA)
-  plots$AGB_T_HA_ORIG <- num_clean(plots$AGB_T_HA_ORIG)
-  plots$SIZE_HA <- num_clean(plots$SIZE_HA)
-  plots$varTot <- num_clean(plots$varTot)
-  
-  if (all(is.na(plots$AGB_T_HA_ORIG)) && any(is.finite(plots$AGB_T_HA))) {
-    plots$AGB_T_HA_ORIG <- plots$AGB_T_HA
-  }
-  
-  if (all(is.na(plots$AGB_T_HA)) && any(is.finite(plots$AGB_T_HA_ORIG))) {
-    plots$AGB_T_HA <- plots$AGB_T_HA_ORIG
-  }
-  
-  if (all(is.na(plots$varTot))) {
-    plots$varTot <- 1
-  }
-  
-  plots <- plots[
-    is.finite(plots$POINT_X) &
-      is.finite(plots$POINT_Y) &
-      is.finite(plots$AGB_T_HA_ORIG),
-    ,
-    drop = FALSE
-  ]
-  
-  message("Valid plots after coordinate/AGB filter: ", nrow(plots))
-  
-  if (nrow(plots) == 0) {
-    stop("No valid plots after coordinate/AGB filtering.", call. = FALSE)
-  }
-  
-  # point-level tc for this target year
-  plots$tc <- extract_tc_points_gfc(
-    dat = plots,
-    target_year = target_year
-  )
-  
-  plots$tc <- num_clean(plots$tc)
-  
-  # same old aggregation center formula
-  plots$Xnew <- aggr * (0.5 + plots$POINT_X %/% aggr)
-  plots$Ynew <- aggr * (0.5 + plots$POINT_Y %/% aggr)
-  
-  message("Distinct grid cells at aggr ", aggr, ": ",
-          dplyr::n_distinct(paste(plots$Xnew, plots$Ynew)))
-  
-  plots$inv <- ifelse(
-    is.finite(plots$varTot) & plots$varTot > 0,
-    1 / plots$varTot,
-    NA_real_
-  )
-  
-  plots$sdMap <- 1
-  
-  # ----------------------------
-  # old-style aggregation
-  # ----------------------------
-  
-  plotsTMP <- aggregate(
-    plots[, c("AGB_T_HA_ORIG", "SIZE_HA")],
-    list(plots$Xnew, plots$Ynew),
-    mean,
-    na.rm = TRUE
-  )
-  
-  modalTMP <- aggregate(
-    plots[, c("BIO", "CODE", "OPEN", "VER", "INVENTORY", "TIER", "AVG_YEAR")],
-    list(plots$Xnew, plots$Ynew),
-    modalClass
-  )
-  
-  plotsTMP <- cbind(plotsTMP, modalTMP[, -c(1, 2), drop = FALSE])
-  
-  varPlot <- aggregate(
-    plots[, "varTot", drop = FALSE],
-    list(plots$Xnew, plots$Ynew),
-    safe_inv_var
-  )
-  
-  varMap <- aggregate(
-    plots[, "sdMap", drop = FALSE],
-    list(plots$Xnew, plots$Ynew),
-    safe_inv_var
-  )
-  
-  agbW <- plyr::ddply(
-    plots,
-    .(paste(Ynew, Xnew)),
-    function(z) {
-      data.frame(
-        Xnew = mean(z$Xnew),
-        Ynew = mean(z$Ynew),
-        AGB_T_HA = safe_wmean(z$AGB_T_HA, z$inv)
-      )
-    }
-  )
-  
-  tcSD <- aggregate(
-    plots$tc,
-    list(plots$Xnew, plots$Ynew),
-    safe_sd
-  )
-  
-  tcMean <- aggregate(
-    plots$tc,
-    list(plots$Xnew, plots$Ynew),
-    safe_mean
-  )
-  
-  blockCOUNT <- aggregate(
-    plots[, "AGB_T_HA", drop = FALSE],
-    list(plots$Xnew, plots$Ynew),
-    function(x) length(na.omit(x))
-  )
-  
-  names(plotsTMP)[1:2] <- c("POINT_X", "POINT_Y")
-  names(varPlot) <- c("POINT_X", "POINT_Y", "varPlot")
-  names(varMap) <- c("POINT_X", "POINT_Y", "varMap")
-  names(tcSD) <- c("POINT_X", "POINT_Y", "TC_PLT_SD")
-  names(tcMean) <- c("POINT_X", "POINT_Y", "TC_PLT_MEAN")
-  names(blockCOUNT) <- c("POINT_X", "POINT_Y", "n")
-  
-  plotsTMP <- plotsTMP %>%
-    left_join(varPlot, by = c("POINT_X", "POINT_Y")) %>%
-    left_join(varMap, by = c("POINT_X", "POINT_Y")) %>%
-    left_join(
-      agbW[, c("Xnew", "Ynew", "AGB_T_HA")],
-      by = c("POINT_X" = "Xnew", "POINT_Y" = "Ynew")
+  dat <- dat %>%
+    dplyr::filter(
+      is.finite(POINT_X),
+      is.finite(POINT_Y),
+      is.finite(AGB_T_HA),
+      is.finite(AVG_YEAR)
     ) %>%
-    left_join(tcSD, by = c("POINT_X", "POINT_Y")) %>%
-    left_join(tcMean, by = c("POINT_X", "POINT_Y")) %>%
-    left_join(blockCOUNT, by = c("POINT_X", "POINT_Y")) %>%
-    filter(n >= minPlots)
-  
-  message("Aggregated cells after minPlots: ", nrow(plotsTMP))
-  
-  if (nrow(plotsTMP) == 0) {
-    warning("No cells left after minPlots filtering.")
-    return(plotsTMP)
-  }
-  
-  rsl <- aggr
-  
-  # ----------------------------
-  # parallel exact-tile GFC sampling per cell
-  # ----------------------------
-  
-  nworkers <- max(1, min(ncores, nrow(plotsTMP)))
-  
-  cl <- parallel::makeCluster(nworkers)
+    dplyr::filter(
+      (AVG_YEAR > epoch - epoch_window &
+         AVG_YEAR < epoch + epoch_window) |
+        (epoch %in% early_exception_epochs &
+           CODE %in% early_epoch_exception_codes)
+    )
+
+  if (nrow(dat) == 0) return(data.frame())
+
+  dat$AGB_T_HA_ORIG[!is.finite(dat$AGB_T_HA_ORIG)] <-
+    dat$AGB_T_HA[!is.finite(dat$AGB_T_HA_ORIG)]
+
+  dat$varTot[!is.finite(dat$varTot)] <- dat$varPlot[!is.finite(dat$varTot)]
+  dat$varTot[!is.finite(dat$varTot)] <- 1
+
+  # Full temporal harmonization to target epoch.
+  dat <- apply_temporal_adjustment(dat, epoch)
+
+  if (nrow(dat) == 0) return(data.frame())
+
+  # Clean again after temporal scripts.
+  dat$POINT_X <- num_clean(dat$POINT_X)
+  dat$POINT_Y <- num_clean(dat$POINT_Y)
+  dat$AGB_T_HA <- num_clean(dat$AGB_T_HA)
+  dat$AGB_T_HA_ORIG <- num_clean(dat$AGB_T_HA_ORIG)
+  dat$AVG_YEAR <- num_clean(dat$AVG_YEAR)
+  dat$varTot <- num_clean(dat$varTot)
+
+  if (!"FAO.ecozone" %in% names(dat)) dat$FAO.ecozone <- NA_character_
+  if (!"ZONE" %in% names(dat)) dat$ZONE <- NA_character_
+  if (!"GEZ" %in% names(dat)) dat$GEZ <- NA_character_
+  if (!"sdGrowth" %in% names(dat)) dat$sdGrowth <- 0
+  if (!"SD" %in% names(dat)) dat$SD <- sqrt(dat$varTot)
+
+  dat <- dat %>%
+    dplyr::filter(
+      is.finite(POINT_X),
+      is.finite(POINT_Y),
+      is.finite(AGB_T_HA)
+    )
+
+  if (nrow(dat) == 0) return(data.frame())
+
+  dat$AGB_T_HA_ORIG[!is.finite(dat$AGB_T_HA_ORIG)] <-
+    dat$AGB_T_HA[!is.finite(dat$AGB_T_HA_ORIG)]
+
+  # Point-level epoch tree cover is retained for TC_PLT summaries.
+  dat$tc <- extract_tc_points_epoch(dat, epoch)
+
+  dat$Xnew <- aggr * (0.5 + dat$POINT_X %/% aggr)
+  dat$Ynew <- aggr * (0.5 + dat$POINT_Y %/% aggr)
+  dat$inv <- ifelse(is.finite(dat$varTot) & dat$varTot > 0,
+                    1 / dat$varTot, NA_real_)
+
+  cells <- dat %>%
+    dplyr::group_by(Xnew, Ynew) %>%
+    dplyr::summarise(
+      POINT_X = dplyr::first(Xnew),
+      POINT_Y = dplyr::first(Ynew),
+      n = sum(is.finite(AGB_T_HA)),
+
+      # Keep original and temporally harmonized quantities separate.
+      AGB_T_HA_ORIG = safe_mean(AGB_T_HA_ORIG),
+      AGB_T_HA_PRE_FF = safe_wmean(AGB_T_HA, inv),
+
+      SIZE_HA = safe_mean(SIZE_HA),
+
+      TC_PLT_MEAN = safe_mean(tc),
+      TC_PLT_SD = safe_sd(tc),
+
+      AVG_YEAR = round(safe_mean(AVG_YEAR)),
+      MapYear = epoch,
+
+      BIO = modalClass(BIO),
+      CODE = modalClass(CODE),
+      INVENTORY = modalClass(INVENTORY),
+      TIER = modalClass(TIER),
+      OPEN = modalClass(OPEN),
+      VER = modalClass(VER),
+
+      ZONE = modalClass(ZONE),
+      FAO.ecozone = modalClass(FAO.ecozone),
+      GEZ = modalClass(GEZ),
+
+      sdGrowth = safe_mean(sdGrowth),
+      varTot = safe_inv_var(varTot),
+      .groups = "drop"
+    ) %>%
+    dplyr::filter(n >= minPlots)
+
+  if (nrow(cells) == 0) return(data.frame())
+
+  cells$SD <- sqrt(cells$varTot)
+
+  cl <- parallel::makeCluster(max(1, min(ncores, nrow(cells))))
   doParallel::registerDoParallel(cl)
-  
-  on.exit({
-    try(parallel::stopCluster(cl), silent = TRUE)
-  }, add = TRUE)
-  
-  FFAGB <- foreach(
-    i = seq_len(nrow(plotsTMP)),
+
+  gfc_df <- foreach(
+    i = seq_len(nrow(cells)),
     .combine = "rbind",
-    .errorhandling = "remove",
     .packages = c("sp", "raster"),
     .export = c(
-      "SRS",
-      "gfcDir",
-      "forestTHs",
-      "num_clean",
-      "MakeBlockPolygon",
-      "gfc_tile_codes_from_pol",
-      "find_gfc_tile",
-      "TCtileNames_gfc",
-      "LYtileNames_gfc",
-      "sampleTreeCover_gfc",
-      "sampleTCStats_gfc"
+      "SRS", "gfcDir", "forestTH", "use_3x3_gfc_tile_window",
+      "MakeBlockPolygon", "gfc_code_from_xy", "parse_gfc_code",
+      "format_gfc_code", "expand_gfc_codes_3x3", "GFCtileCodes_core",
+      "GFCtileCodes", "find_gfc_tile", "extent_overlaps", "get_tc_tiles",
+      "apply_epoch_loss_to_tc", "extract_gfc_polygon"
     )
   ) %dopar% {
-    
-    pol <- MakeBlockPolygon(
-      plotsTMP$POINT_X[i],
-      plotsTMP$POINT_Y[i],
-      rsl
-    )
-    
-    gridVals <- sampleTCStats_gfc(
-      pol = pol,
-      target_year = target_year
-    )
-    
-    treeCovers <- sampleTreeCover_gfc(
-      pol = pol,
-      thresholds = forestTHs,
-      target_year = target_year,
-      wghts = FALSE
-    )
-    
-    c(
-      plotsTMP$POINT_X[i],
-      plotsTMP$POINT_Y[i],
-      plotsTMP$TC_PLT_SD[i],
-      plotsTMP$TC_PLT_MEAN[i],
-      gridVals$SD,
-      gridVals$MEAN,
-      as.numeric(plotsTMP$n[i]),
-      treeCovers[1] * plotsTMP$AGB_T_HA_ORIG[i],
-      plotsTMP$SIZE_HA[i],
-      plotsTMP$OPEN[i],
-      plotsTMP$VER[i],
-      plotsTMP$varPlot[i],
-      plotsTMP$AVG_YEAR[i],
-      plotsTMP$BIO[i],
-      plotsTMP$CODE[i],
-      plotsTMP$INVENTORY[i],
-      plotsTMP$TIER[i]
+    pol <- MakeBlockPolygon(cells$POINT_X[i], cells$POINT_Y[i], aggr)
+    z <- extract_gfc_polygon(pol, epoch)
+
+    data.frame(
+      FF_USED = z$ff,
+      TC_GRID_MEAN = z$tc_mean,
+      TC_GRID_SD = z$tc_sd,
+      GFC_PIXEL_N = z$pixel_n,
+      GFC_STATUS = z$status,
+      stringsAsFactors = FALSE
     )
   }
-  
-  if (is.null(FFAGB) || nrow(as.data.frame(FFAGB)) == 0) {
-    warning("All parallel GFC sampling tasks failed.")
-    return(data.frame())
+
+  parallel::stopCluster(cl)
+  foreach::registerDoSEQ()
+
+  out <- dplyr::bind_cols(cells, gfc_df)
+
+  # Primary AGB:
+  # latest working AGBref keeps the temporally harmonized aggregated value
+  # as the reference and retains FF as a diagnostic.
+  if (isTRUE(apply_grid_forest_fraction)) {
+    out$AGB_T_HA <- dplyr::case_when(
+      is.finite(out$FF_USED) ~ out$AGB_T_HA_PRE_FF * out$FF_USED,
+      !is.finite(out$FF_USED) &
+        isTRUE(fallback_to_unscaled_when_gfc_missing) ~ out$AGB_T_HA_PRE_FF,
+      TRUE ~ NA_real_
+    )
+
+    out$CELL_STATUS <- dplyr::case_when(
+      is.finite(out$FF_USED) ~ "FOREST_SCALED",
+      !is.finite(out$FF_USED) ~ "UNSCALED_GFC_MISSING",
+      TRUE ~ "OTHER"
+    )
+  } else {
+    out$AGB_T_HA <- out$AGB_T_HA_PRE_FF
+    out$CELL_STATUS <- "UNSCALED_PRIMARY"
   }
-  
-  FFAGB <- as.data.frame(FFAGB, stringsAsFactors = FALSE)
-  
-  names(FFAGB) <- c(
-    "POINT_X", "POINT_Y",
-    "TC_PLT_SD", "TC_PLT_MEAN",
-    "TC_GRID_SD", "TC_GRID_MEAN",
-    "n",
-    "AGB_T_HA",
-    "SIZE_HA",
-    "OPEN", "VER",
-    "varTot",
-    "AVG_YEAR",
-    "BIO", "CODE", "INVENTORY", "TIER"
-  )
-  
-  FFAGB[, 1:13] <- lapply(FFAGB[, 1:13], num_clean)
-  
-  FFAGB
+
+  # Targeted current-QC correction. Do not overwrite TC_GRID_MEAN.
+  out$AUS1_SPECIAL_CORR <- FALSE
+  if (isTRUE(apply_aus1_high_agb_fix) &&
+      res_label %in% c("10km", "25km")) {
+
+    idx_aus <- out$CODE == "AUS1" &
+      out$AGB_T_HA > 400 &
+      is.finite(out$TC_GRID_MEAN)
+
+    out$AGB_T_HA[idx_aus] <-
+      out$AGB_T_HA[idx_aus] *
+      ((out$TC_GRID_MEAN[idx_aus] * aus1_tc_discount) / 100)
+
+    out$AUS1_SPECIAL_CORR[idx_aus] <- TRUE
+  }
+
+  # Output schema aligned to the latest combined AGBref, with extra QC fields.
+  out %>%
+    dplyr::transmute(
+      TC_PLT_SD,
+      TC_PLT_MEAN,
+      TC_GRID_SD,
+      TC_GRID_MEAN,
+      n,
+      AGB_T_HA_ORIG,
+      SIZE_HA,
+      OPEN,
+      VER,
+      varTot,
+      AVG_YEAR,
+      BIO,
+      CODE,
+      INVENTORY,
+      TIER,
+      POINT_X,
+      POINT_Y,
+      ZONE,
+      FAO.ecozone,
+      GEZ,
+      sdGrowth,
+      SD,
+      Resolution = res_label,
+      Year = epoch,
+  #    AGB_T_HA_PRE_FF,
+   #   FF_USED,
+    #  GFC_PIXEL_N,
+     # GFC_STATUS,
+      #CELL_STATUS,
+      )
 }
 
 # ----------------------------
-# 9. Run multi-resolution x multi-epoch
+# 8. Run
 # ----------------------------
-
+setwd(dataDir)
 data_frames <- list()
-run_log <- data.frame()
+agbref <- data.frame()
 
-for (i in seq_len(nrow(scales))) {
-  
-  label <- scales$label[i]
-  aggr <- scales$aggr[i]
-  minPlots <- scales$minPlots[i]
-  
-  for (epoch in target_epochs) {
+for (ep in target_epochs) {
+  for (j in seq_len(nrow(scales))) {
     
-    message("\n================================================")
-    message("Building: ", label, " | epoch ", epoch)
-    message("Aggregation: ", aggr)
-    message("================================================")
+    res_label <- scales$label[j]
+    aggr <- scales$aggr[j]
+    minPlots <- scales$minPlots[j]
     
-    mpAGB <- invDasymetry_gfc_exact(
-      plots = val.rm,
-      clmn = "ZONE",
-      value = "All",
+    message("Running: epoch=", ep, " | resolution=", res_label)
+    
+    x <- make_agbref_epoch_resolution(
+      dat = val.rm,
+      epoch = ep,
+      res_label = res_label,
       aggr = aggr,
-      minPlots = minPlots,
-      forestTHs = forestTHs,
-      target_year = epoch,
-      ncores = ncores
+      minPlots = minPlots
     )
     
-    mpAGB[] <- lapply(
-      mpAGB,
-      function(x) if (is.list(x)) sapply(x, toString) else x
-    )
+    nm <- paste(res_label, ep, sep = "_")
+    data_frames[[nm]] <- x
     
-    list_name <- paste(label, epoch, sep = "_")
-    data_frames[[list_name]] <- mpAGB
-    
-    save(
-      mpAGB,
-      file = file.path(
-        outDir,
-        paste0("AGBref_ready_", label, "_", epoch, "_", Sys.Date(), ".Rdata")
+    if (nrow(x) > 0) {
+      agbref <- dplyr::bind_rows(agbref, x)
+      names(agbref)[names(agbref) == "AGB_T_HA_ORIG"] <- "AGB_T_HA"
+      write.csv(
+        x,
+        file.path(outDir, paste0("AGBref_", res_label, "_", ep, ".csv")),
+        row.names = FALSE
       )
-    )
-    
-    write.csv(
-      mpAGB,
-      file.path(
-        outDir,
-        paste0("AGBref_ready_", label, "_", epoch, "_", Sys.Date(), ".csv")
-      ),
-      row.names = FALSE
-    )
-    
-    run_log <- rbind(
-      run_log,
-      data.frame(
-        resolution = label,
-        aggr = aggr,
-        epoch = epoch,
-        rows = nrow(mpAGB),
-        mean_AGB = mean(num_clean(mpAGB$AGB_T_HA), na.rm = TRUE),
-        na_AGB = sum(is.na(num_clean(mpAGB$AGB_T_HA))),
-        stringsAsFactors = FALSE
-      )
-    )
-    
-    message("Rows: ", nrow(mpAGB))
-    message("Mean AGB: ", mean(num_clean(mpAGB$AGB_T_HA), na.rm = TRUE))
-    message("NA AGB: ", sum(is.na(num_clean(mpAGB$AGB_T_HA))))
-    
-    gc(verbose = FALSE)
+    }
   }
 }
 
-# ----------------------------
-# 10. Save combined outputs
-# ----------------------------
 
-save(
-  data_frames,
-  file = file.path(
-    outDir,
-    paste0("AGBrefs_ready_multires_multiepoch_", Sys.Date(), ".Rdata")
-  )
-)
-
-saveRDS(
-  data_frames,
-  file.path(
-    outDir,
-    paste0("AGBrefs_ready_multires_multiepoch_", Sys.Date(), ".rds")
-  )
-)
-
-write.csv(
-  run_log,
-  file.path(
-    outDir,
-    paste0("AGBrefs_ready_multires_multiepoch_log_", Sys.Date(), ".csv")
-  ),
-  row.names = FALSE
-)
-
-message("\nFinished multi-resolution x multi-epoch AGBref-ready aggregation.")
-message("Output folder: ", outDir)
-
-print(run_log)
-print(vapply(data_frames, nrow, integer(1)))
